@@ -14,6 +14,7 @@ from rl_utils import (
 from .drqv2 import DrQV2Agent, Actor, Critic
 from utils import attribution_augmentation, random_overlay
 import random
+from torchvision.models import resnet18, resnet34
 
 def _get_out_shape(in_shape, layers):
     x = torch.randn(*in_shape).unsqueeze(0)
@@ -40,6 +41,8 @@ class SharedCNN(nn.Module):
         x = x / 255.0 - 0.5
         return self.layers(x)
 
+    
+
 class SACEncoder(nn.Module):
     def __init__(self, shared_cnn, projection=None):
         super().__init__()
@@ -57,25 +60,45 @@ class SACEncoder(nn.Module):
 class CNNEncoder(nn.Module):
     def __init__(self, obs_shape):
         super().__init__()
-
-        assert len(obs_shape) == 3
+        self.model = resnet18(pretrained=True)
+        self.image_channel=3
         self.embed_dim = 32 * 35 * 35
         self.repr_dim = 512
 
-        self.convnet = nn.Sequential(nn.Conv2d(obs_shape[0], 32, 3, stride=2),
-                                     nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
-                                     nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
-                                     nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
-                                     nn.ReLU())
-        self.projector = nn.Linear(self.embed_dim, self.repr_dim)
-        self.apply(utils.weight_init)
+        #self.convnet = nn.Sequential(nn.Conv2d(obs_shape[0], 32, 3, stride=2),
+        #                             nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
+        #                             nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
+        #                             nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
+        #                             nn.ReLU())
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.projector = nn.Linear(61952, self.repr_dim)
+        #self.apply(utils.weight_init)
 
-    def forward(self, obs):
+    def forward(self, obs, flatten=True):
+        
+        
         obs = obs / 255.0 - 0.5
-        h = self.convnet(obs)
-        h = h.view(h.shape[0], -1)
-        h = self.projector(h)
+        time_step = obs.shape[1] // self.image_channel
+        obs = obs.view(obs.shape[0], time_step, self.image_channel, obs.shape[-2], obs.shape[-1])
+        obs = obs.view(obs.shape[0] * time_step, self.image_channel, obs.shape[-2], obs.shape[-1])
+
+        for name, module in self.model._modules.items():
+            obs = module(obs)
+            if name == 'layer2':
+                break
+
+        conv = obs.view(obs.size(0) // time_step, time_step, obs.size(1), obs.size(2), obs.size(3))
+        conv_current = conv[:, 1:, :, :, :]
+        conv_prev = conv_current - conv[:, :time_step - 1, :, :, :].detach()
+        conv = torch.cat([conv_current, conv_prev], axis=1)
+        conv = conv.view(conv.size(0), conv.size(1) * conv.size(2), conv.size(3), conv.size(4))
+        if flatten:
+            conv = conv.view(conv.size(0), -1)
+        h = self.projector(conv)
         return h
+    
+        
 
 
 
@@ -116,7 +139,7 @@ class AttributionPredictor(nn.Module):
         return self.decoder(x, action)
 
 
-class SGQNAgent(DrQV2Agent):
+class SGQNPIEGAgent(DrQV2Agent):
     def __init__(self, aux_lr=0.3, aux_beta=0.9, sgqn_quantile=0.95, **kwargs):
         super().__init__(**kwargs)
         # shared_cnn = SharedCNN(kwargs['obs_shape']).to(self.device)

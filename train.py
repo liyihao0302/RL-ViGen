@@ -224,7 +224,7 @@ class Workspace:
                 self.replay_storage.add(time_step)
                 self.train_video_recorder.init(time_step.observation)
                 # try to save snapshot
-                if self.cfg.save_snapshot and (self.global_step % int(5e4) == 0):
+                if self.cfg.save_snapshot and (self.global_step % int(1e4) == 0):
                     self.save_snapshot()
                 episode_step = 0
                 episode_reward = 0
@@ -272,7 +272,7 @@ class Workspace:
             self.__dict__[k] = v
 
 
-@hydra.main(config_path='cfgs', config_name='svea_config')
+@hydra.main(config_path='cfgs', config_name='sgqn_config')
 def main(cfg):
     from train import Workspace as W
     root_dir = Path.cwd()

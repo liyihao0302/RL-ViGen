@@ -6,10 +6,7 @@ import torch.nn.functional as F
 import utils
 from rl_utils import (
     compute_attribution,
-    compute_attribution_mask,
-    make_attribution_pred_grid,
-    make_obs_grid,
-    make_obs_grad_grid,
+    compute_attribution_mask
 )
 from .drqv2 import DrQV2Agent, Actor, Critic
 from utils import attribution_augmentation, random_overlay
@@ -18,40 +15,53 @@ import random
 def _get_out_shape(in_shape, layers):
     x = torch.randn(*in_shape).unsqueeze(0)
     return layers(x).squeeze(0).shape
+from captum.attr import GuidedBackprop, GuidedGradCam
+class ModelWrapper(torch.nn.Module):
+    def __init__(self, critic, action=None):
+        super(ModelWrapper, self).__init__()
+        
+        self.critic = critic
+        self.action = action
 
-class SharedCNN(nn.Module):
-    def __init__(self, obs_shape, num_layers=11, num_filters=32):
-        super().__init__()
-        assert len(obs_shape) == 3
-        self.num_layers = num_layers
-        self.num_filters = num_filters
+    def forward(self, obs):
+        
+        if self.action is None:
+            return self.critic(obs)[0]
+        return self.critic(obs, self.action)[0]
 
-        self.layers = [
-            nn.Conv2d(obs_shape[0], num_filters, 3, stride=2),
-        ]
-        for _ in range(1, num_layers):
-            self.layers.append(nn.ReLU())
-            self.layers.append(nn.Conv2d(num_filters, num_filters, 3, stride=1))
-        self.layers = nn.Sequential(*self.layers)
-        self.out_shape = _get_out_shape(obs_shape, self.layers)
-        self.apply(utils.weight_init)
 
-    def forward(self, x):
-        x = x / 255.0 - 0.5
-        return self.layers(x)
+def compute_guided_backprop(obs, action, critic):
+    model = ModelWrapper(critic, action=action)
+    gbp = GuidedBackprop(model)
+    attribution = gbp.attribute(obs)
+    return attribution
 
-class SACEncoder(nn.Module):
-    def __init__(self, shared_cnn, projection=None):
-        super().__init__()
-        self.shared_cnn = shared_cnn
-        self.embed_dim = 32 * 21 * 21
-        self.repr_dim = 512
-        self.projection = nn.Linear(self.embed_dim, self.repr_dim)
+def compute_guided_gradcam(obs, action, critic):
+    obs.requires_grad_()
+    obs.retain_grad()
+    model = ModelWrapper(critic, action=action)
+    gbp = GuidedGradCam(model,layer=model.model.encoder.head_cnn.layers)
+    attribution = gbp.attribute(obs,attribute_to_layer_input=True)
+    return attribution
 
-    def forward(self, x):
-        x = self.shared_cnn(x)
-        x = x.view(x.shape[0], -1)
-        return self.projection(x)
+
+
+def compute_attribution(critic, obs, action=None, method="guided_backprop"):
+    
+    if method == "guided_backprop":
+        return compute_guided_backprop(obs, action, critic)
+    if method == 'guided_gradcam':
+        return compute_guided_gradcam(obs,action, critic)
+
+
+
+
+def compute_attribution_mask(obs_grad, quantile=0.95):
+
+    q = torch.quantile(obs_grad, quantile, 1)
+    mask = (obs_grad >= q[:,None])
+    return mask
+
 
 
 class CNNEncoder(nn.Module):
@@ -82,27 +92,24 @@ class CNNEncoder(nn.Module):
 class AttributionDecoder(nn.Module):
     def __init__(self,action_shape, emb_dim=100) -> None:
         super().__init__()
-        self.proj = nn.Linear(in_features=emb_dim+action_shape, out_features=32*21*21)
-        self.conv1 = nn.Conv2d(
-            in_channels=32, out_channels=128, kernel_size=3, padding=1
-        )
+        self.linear1 = nn.Linear(in_features=514, out_features=1024)
+        
         self.relu = nn.ReLU()
-        self.conv2 = nn.Conv2d(
-            in_channels=128, out_channels=64, kernel_size=3, padding=1
-        )
-        self.conv3 = nn.Conv2d(in_channels=64, out_channels=9, kernel_size=3, padding=1)
+        self.linear2 = nn.Linear(in_features=1024, out_features=512)
+        
+        self.linear3 = nn.Linear(in_features=512, out_features=512)
+        
+
+        
 
     def forward(self, x, action):
         x = torch.cat([x,action],dim=1)
-        x = self.proj(x).view(-1, 32, 21, 21)
+        x = self.linear1(x)
         x = self.relu(x)
-        x = self.conv1(x)
-        x = F.upsample(x, scale_factor=2)
+        x = self.linear2(x)
         x = self.relu(x)
-        x = self.conv2(x)
-        x = F.upsample(x, scale_factor=2)
+        x = self.linear3(x)
         x = self.relu(x)
-        x = self.conv3(x)
         return x
 
 class AttributionPredictor(nn.Module):
@@ -116,14 +123,17 @@ class AttributionPredictor(nn.Module):
         return self.decoder(x, action)
 
 
-class SGQNAgent(DrQV2Agent):
+class SGQNDINOAgent(DrQV2Agent):
     def __init__(self, aux_lr=0.3, aux_beta=0.9, sgqn_quantile=0.95, **kwargs):
         super().__init__(**kwargs)
         # shared_cnn = SharedCNN(kwargs['obs_shape']).to(self.device)
         # self.encoder = SACEncoder(shared_cnn).to(self.device)
+        self.encoder_teacher = CNNEncoder(kwargs['obs_shape']).to(self.device)
         self.encoder = CNNEncoder(kwargs['obs_shape']).to(self.device)
+
         self.attribution_predictor = AttributionPredictor(kwargs['action_shape'][0],
                                                           self.encoder).to(self.device)
+
         self.quantile = sgqn_quantile
 
         self.actor = Actor(self.encoder.repr_dim, kwargs['action_shape'], kwargs['feature_dim'],
@@ -144,7 +154,7 @@ class SGQNAgent(DrQV2Agent):
             lr=aux_lr,
             betas=(aux_beta, 0.999),
         )
-
+        
         self.train()
         self.critic_target.train()
         
@@ -190,11 +200,12 @@ class SGQNAgent(DrQV2Agent):
 
 
     def update_aux(self, obs, action):
-        
-        obs_grad = compute_attribution(self.encoder, self.critic, obs, action.detach())
+        embedding = self.encoder_teacher(obs)
+        obs_grad = compute_attribution(self.critic, embedding, action.detach())
         mask = compute_attribution_mask(obs_grad, self.quantile)
         s_tilde = random_overlay(obs.clone())
         self.aux_optimizer.zero_grad()
+        mask.detach_()
         pred_attrib, aux_loss = self.compute_attribution_loss(s_tilde, action, mask)
         aux_loss.backward()
         self.aux_optimizer.step()
@@ -214,13 +225,14 @@ class SGQNAgent(DrQV2Agent):
         obs = self.aug(obs.float())
         aug_obs = obs.clone()
         next_obs = self.aug(next_obs.float())
-
-        obs_grad = compute_attribution(self.encoder, self.critic, obs, action.detach())
+        embedding = self.encoder(obs)
+        
+        obs_grad = compute_attribution(self.critic, embedding, action.detach())
         mask = compute_attribution_mask(obs_grad, self.quantile)
-        masked_obs = obs * mask
+        masked_obs = embedding * mask
         masked_obs[mask < 1] = random.uniform(obs.view(-1).min(), obs.view(-1).max())
 
-        masked_obs = self.encoder(masked_obs)
+        
         # encode
         obs = self.encoder(obs)
         with torch.no_grad():
@@ -242,5 +254,7 @@ class SGQNAgent(DrQV2Agent):
         # this obs should be augmented obs
 
         self.update_aux(aug_obs, action)
-
+        import pdb; pdb.set_trace()
         return metrics
+
+    

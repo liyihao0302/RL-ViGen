@@ -25,7 +25,7 @@
 #              use_wandb=False
 
 
-easy_task_list=('unitree_walk')
+easy_task_list=('finger_spin')
 frames=1001000
 feature_dim=50
 sgqn_quantile=0.93
@@ -51,7 +51,7 @@ do
 ##          agent.aux_lr=${aux_lr} &
 #	done
 
-	CUDA_VISIBLE_DEVICES=0  python train.py \
+	CUDA_VISIBLE_DEVICES=1  python ../train.py \
 								env=${env} \
 								task=${task_name} \
 								seed=5 \
@@ -61,7 +61,7 @@ do
 								num_train_frames=${frames} \
 								save_snapshot=True \
 								save_video=False \
-								feature_dim=${feature_dim}
-# 							  agent.sgqn_quantile=${sgqn_quantile} \
-# 							  agent.aux_lr=${aux_lr}
+								feature_dim=${feature_dim}\
+ 							  	agent.sgqn_quantile=${sgqn_quantile} \
+ 							  	agent.aux_lr=${aux_lr}
 done

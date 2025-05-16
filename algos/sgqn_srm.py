@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import utils
+from utils import random_mask_freq_v2, random_mask_freq_v1
 from rl_utils import (
     compute_attribution,
     compute_attribution_mask,
@@ -116,7 +117,7 @@ class AttributionPredictor(nn.Module):
         return self.decoder(x, action)
 
 
-class SGQNAgent(DrQV2Agent):
+class SGQNSRMAgent(DrQV2Agent):
     def __init__(self, aux_lr=0.3, aux_beta=0.9, sgqn_quantile=0.95, **kwargs):
         super().__init__(**kwargs)
         # shared_cnn = SharedCNN(kwargs['obs_shape']).to(self.device)
@@ -193,7 +194,10 @@ class SGQNAgent(DrQV2Agent):
         
         obs_grad = compute_attribution(self.encoder, self.critic, obs, action.detach())
         mask = compute_attribution_mask(obs_grad, self.quantile)
-        s_tilde = random_overlay(obs.clone())
+        try:
+            s_tilde = random_mask_freq_v2(random_overlay(obs.clone()))
+        except:
+            s_tilde = random_overlay(obs.clone())
         self.aux_optimizer.zero_grad()
         pred_attrib, aux_loss = self.compute_attribution_loss(s_tilde, action, mask)
         aux_loss.backward()
